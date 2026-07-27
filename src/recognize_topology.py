@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 
 from electrical_logic_inference import enhance_one
-from component_template_matching import (
+from component_matching_core import (
     Shape,
     bbox_center,
     bbox_distance,
