@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+data/
+output/
+results/
+*.dxf
+*.dwg
+*.zip
+
+.DS_Store
+Thumbs.db

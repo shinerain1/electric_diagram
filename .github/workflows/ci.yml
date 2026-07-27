@@ -1,0 +1,29 @@
+name: smoke-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile src/*.py scripts/*.py tests/*.py
+      - run: python examples/create_synthetic_dxf.py --output data/synthetic.dxf
+      - name: Run recognizer
+        run: |
+          python src/recognize_topology.py \
+            --dxf-dir data \
+            --component-library knowledge/standard_component_library.json \
+            --logic-library knowledge/electrical_logic_library.json \
+            --output-dir output \
+            --drawings synthetic
+      - name: Verify output schema
+        run: |
+          python tests/verify_output.py \
+            --result output/synthetic/automatic/synthetic_自动识别.json
