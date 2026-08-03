@@ -1,0 +1,18 @@
+{
+  "schema_version": "3.0",
+  "scale_h": 100.0,
+  "base_model": "../models/base_conductor_deployment.joblib",
+  "base_feature_count": 18,
+  "base_model_role": "initial_conductor_probability",
+  "role_model": "../models/component_side_dxf_deployment.pt",
+  "role_model_type": "four_layer_edge_gated_residual_graph_network",
+  "role_classes": [
+    "component_body",
+    "interface_lead",
+    "main_conductor"
+  ],
+  "same_component_edge_model": "../models/same_component_edge_dxf_deployment.joblib",
+  "boundary_algorithm": "iterative_component_boundaries",
+  "current_drawing_truth_used_during_inference": false,
+  "legacy_candidate_rules_are_default": false
+}
