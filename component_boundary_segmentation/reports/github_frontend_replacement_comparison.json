@@ -1,0 +1,41 @@
+{
+  "schema_version": "github-frontend-replacement-comparison-v1",
+  "comparison_scope": "first three stages only: DXF parsing, primitive classification, component boundary segmentation",
+  "drawing_count": 6,
+  "truth_instance_count": 303,
+  "truth_used_during_inference": false,
+  "same_truth_and_metric_for_both_versions": true,
+  "metric": "DXF HANDLE set boundary matching",
+  "github_original_commit": {
+    "commit": "cf569a1",
+    "predicted_cluster_count": 32,
+    "mean_truth_best_boundary_f1": 0.09856985698569858,
+    "component_handle_precision": 0.8839285714285714,
+    "component_handle_recall": 0.2475,
+    "component_handle_f1": 0.38671875,
+    "truth_recall_boundary_f1_0_80": 0.10561056105610561,
+    "prediction_merge_rate": 0.0
+  },
+  "learned_iterative_frontend": {
+    "predicted_cluster_count": 316,
+    "mean_truth_best_boundary_f1": 0.942171689696442,
+    "component_handle_precision": 0.9662775616083009,
+    "component_handle_recall": 0.93125,
+    "component_handle_f1": 0.9484404837683005,
+    "truth_recall_boundary_f1_0_80": 0.8745874587458746,
+    "prediction_merge_rate": 0.0
+  },
+  "delta_new_minus_original": {
+    "mean_truth_best_boundary_f1": 0.8436018327107434,
+    "component_handle_precision": 0.0823489901797295,
+    "component_handle_recall": 0.68375,
+    "component_handle_f1": 0.5617217337683005,
+    "truth_recall_boundary_f1_0_80": 0.768976897689769,
+    "prediction_merge_rate": 0.0
+  },
+  "limitations": [
+    "The six DXF drawings were used by earlier weak-supervision migration experiments.",
+    "The comparison confirms replacement behavior on the current task but is not an independent cross-organization blind test.",
+    "The unadapted six-layer joint SVG model was not deployed because its direct-DXF mean boundary F1 was 0.6273875006548274."
+  ]
+}

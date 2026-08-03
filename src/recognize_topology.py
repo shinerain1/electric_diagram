@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import statistics
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,6 +33,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
 
+from boundary_learning import (
+    acceptance_threshold as boundary_acceptance_threshold,
+    load_boundary_model,
+    predict_boundary_quality,
+)
 from electrical_logic_inference import enhance_one
 from component_matching_core import (
     Shape,
@@ -1291,6 +1297,8 @@ def build_block_equipment(
             ],
             "bbox": [round(value, 6) for value in box],
             "source_handles": candidate["owned_handles"],
+            "symbol_core_handles": candidate["owned_handles"],
+            "physical_boundary_handles": candidate["owned_handles"],
             "confidence": (
                 "high" if evidence_confidence >= 0.90 else "medium"
             ),
@@ -1399,6 +1407,7 @@ def select_group_result_generic(
     candidates: list[dict[str, Any]],
     evaluations: list[dict[str, Any]],
     raw_h: float,
+    boundary_model: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Select by template evidence without borrowing annotation heuristics."""
     if not evaluations:
@@ -1410,10 +1419,28 @@ def select_group_result_generic(
         primitive_total = sum(
             evaluation["candidate"]["primitive_counts"].values()
         )
+        learned_boundary = None
+        if boundary_model is not None:
+            learned_boundary = {
+                "score": round(
+                    predict_boundary_quality(
+                        boundary_model,
+                        group,
+                        evaluation["candidate"]["owned_handles"],
+                    ),
+                    6,
+                ),
+                "acceptance_threshold": boundary_acceptance_threshold(
+                    boundary_model
+                ),
+                "model_schema": boundary_model["schema_version"],
+            }
+            evaluation["boundary_learning"] = learned_boundary
         provisional = {
             "candidate": evaluation["candidate"],
             "top": top,
             "family_margin": margin,
+            "boundary_learning": learned_boundary,
         }
         acceptable, _ = candidate_acceptable(
             group,
@@ -1424,10 +1451,23 @@ def select_group_result_generic(
         # a coherent multi-primitive motif.  Candidates that already satisfy
         # the structural acceptance rules rank ahead of an ambiguous isolated
         # primitive even when that primitive has a superficially perfect score.
-        selection_score = float(top["combined_score"]) + min(
-            math.log2(max(primitive_total, 1)) * 0.75,
-            2.5,
-        )
+        if learned_boundary is not None:
+            # The learned score is the predicted primitive-membership F1 and is
+            # deliberately primary. Template evidence only resolves very close
+            # ties; it does not teach the boundary model component names.
+            selection_score = (
+                float(learned_boundary["score"]) * 100.0
+                + float(top["combined_score"]) * 0.01
+                + min(
+                    math.log2(max(primitive_total, 1)) * 0.20,
+                    0.75,
+                )
+            )
+        else:
+            selection_score = float(top["combined_score"]) + min(
+                math.log2(max(primitive_total, 1)) * 0.75,
+                2.5,
+            )
         acceptance_tier = (
             2
             if acceptable and primitive_total > 1
@@ -1478,6 +1518,7 @@ def select_group_result_generic(
         "family_margin": round(margin, 2),
         "confidence": confidence,
         "candidate_count": len(candidates),
+        "boundary_learning": best.get("boundary_learning"),
     }
 
 
@@ -1492,36 +1533,57 @@ def candidate_acceptable(
     margin = float(result["family_margin"])
     owned = set(result["candidate"]["owned_handles"])
     owned_shapes = [shape for shape in group if shape.handle in owned]
+    if not owned_shapes:
+        return False, "candidate_has_no_owned_primitives"
+    learned_frontend = result.get("learned_frontend_boundary") or {}
     closed_count = sum(shape.closed for shape in owned_shapes)
     circle_count = sum(shape.kind == "circle" for shape in owned_shapes)
     box = merge_bbox(shape.bbox for shape in owned_shapes)
     span = max(box[2] - box[0], box[3] - box[1])
-    if family not in TYPE_BY_FAMILY:
-        return False, "template_family_not_in_equipment_scope"
-    if span < raw_h * 0.20 or span > raw_h * 12.0:
+    if (
+        span < raw_h * 0.20 or span > raw_h * 12.0
+    ) and not bool(learned_frontend.get("accepted")):
         return False, "component_scale_outside_h_range"
-    if family == "PowerTransformer":
+    template_failure = ""
+    if family not in TYPE_BY_FAMILY:
+        template_failure = "template_family_not_in_equipment_scope"
+    elif family == "PowerTransformer":
         if circle_count < 2:
-            return False, "transformer_requires_two_circle_primitives"
-        if score < 55.0 or margin < 3.0:
-            return False, "transformer_template_evidence_too_weak"
-        return True, "two_circle_transformer_template_accepted"
-    if score < MINIMUM_TEMPLATE_SCORE:
-        return False, "template_score_below_threshold"
-    if margin < MINIMUM_FAMILY_MARGIN and score < 90.0:
-        return False, "template_family_margin_too_small"
-    if len(owned) == 1:
-        if (
-            family == "ConnectivePoint"
-            and closed_count
-            and not circle_count
-            and raw_h * 0.50 <= span <= raw_h * 3.0
-        ):
-            return True, "single_closed_connective_symbol"
+            template_failure = "transformer_requires_two_circle_primitives"
+        elif score < 55.0 or margin < 3.0:
+            template_failure = "transformer_template_evidence_too_weak"
+        else:
+            return True, "two_circle_transformer_template_accepted"
+    elif (
+        len(owned) == 1
+        and family == "ConnectivePoint"
+        and closed_count
+        and not circle_count
+        and raw_h * 0.50 <= span <= raw_h * 8.0
+        and score >= 72.0
+    ):
+        return True, "single_closed_connective_symbol"
+    elif score < MINIMUM_TEMPLATE_SCORE:
+        template_failure = "template_score_below_threshold"
+    elif margin < MINIMUM_FAMILY_MARGIN and score < 90.0:
+        template_failure = "template_family_margin_too_small"
+    elif len(owned) == 1:
         if family in SWITCH_FAMILIES and closed_count and score >= 88.0:
             return True, "single_closed_switch_symbol"
-        return False, "single_generic_primitive_rejected"
-    return True, "full_template_candidate_accepted"
+        template_failure = "single_generic_primitive_rejected"
+    else:
+        return True, "full_template_candidate_accepted"
+
+    learned = result.get("boundary_learning") or {}
+    learned_score = float(learned.get("score") or 0.0)
+    learned_threshold = float(
+        learned.get("acceptance_threshold") or 1.01
+    )
+    if len(owned) >= 2 and learned_score >= learned_threshold:
+        return True, "learned_category_agnostic_boundary_accepted"
+    if bool(learned_frontend.get("accepted")):
+        return True, "learned_iterative_boundary_accepted"
+    return False, template_failure or "candidate_rejected"
 
 
 def template_record_index(
@@ -1572,8 +1634,26 @@ def build_equipment(
             )
             continue
 
-        family = str(result["top"]["family"])
-        physical_type = TYPE_BY_FAMILY[family]
+        template_family = str(result["top"]["family"])
+        learned_unknown = reason in {
+            "learned_category_agnostic_boundary_accepted",
+            "learned_iterative_boundary_accepted",
+        }
+        generic_switch = learned_unknown and template_family in SWITCH_FAMILIES
+        family = (
+            "GenericSwitch"
+            if generic_switch
+            else "Unknown"
+            if learned_unknown
+            else template_family
+        )
+        physical_type = (
+            "SwitchCombination"
+            if generic_switch
+            else "UnknownComponent"
+            if learned_unknown
+            else TYPE_BY_FAMILY[template_family]
+        )
         selected_shapes = [
             shape for shape in group if shape.handle in selected_handles
         ]
@@ -1581,10 +1661,16 @@ def build_equipment(
             continue
         box = merge_bbox(shape.bbox for shape in selected_shapes)
         template = records.get(
-            (str(result["top"]["template_id"]), family),
+            (str(result["top"]["template_id"]), template_family),
             {},
         )
-        terminal_count = int(template.get("terminal_count") or 1)
+        terminal_count = (
+            2
+            if generic_switch
+            else 1
+            if learned_unknown
+            else int(template.get("terminal_count") or 1)
+        )
         equipment_id = f"EQ{len(equipment) + 1:05d}"
         confidence = (
             "high"
@@ -1606,6 +1692,8 @@ def build_equipment(
                 ],
                 "bbox": [round(value, 6) for value in box],
                 "source_handles": sorted(selected_handles),
+                "symbol_core_handles": sorted(selected_handles),
+                "physical_boundary_handles": sorted(selected_handles),
                 "confidence": confidence,
                 "confidence_score": round(
                     float(result["top"]["combined_score"]) / 100.0,
@@ -1618,6 +1706,9 @@ def build_equipment(
                 "match_mode": "all_template_geometry_similarity",
                 "matched_templates": [result["top"]["template_id"]],
                 "template_family": family,
+                "template_family_candidate": (
+                    template_family if learned_unknown else None
+                ),
                 "template_name": result["top"]["template_name"],
                 "template_score": result["top"]["combined_score"],
                 "geometry_score": result["top"]["geometry_score"],
@@ -1630,6 +1721,17 @@ def build_equipment(
                 "text_prior": prior,
                 "top5_families": result["family_alternatives"],
                 "recognition_decision": reason,
+                "boundary_learning": result.get("boundary_learning"),
+                "learned_frontend_boundary": result.get(
+                    "learned_frontend_boundary"
+                ),
+                "boundary_recognition_status": (
+                    "recognized_generic_switch"
+                    if generic_switch
+                    else "recognized_unknown_type"
+                    if learned_unknown
+                    else "recognized_and_classified"
+                ),
             }
         )
         consumed.update(selected_handles)
@@ -1656,6 +1758,10 @@ def complete_transformer_components(
     for item in equipment:
         if item.get("physical_type") != "PowerTransformer":
             continue
+        item.setdefault(
+            "symbol_core_handles",
+            list(item.get("source_handles") or []),
+        )
         owned = [
             shape_by_handle[handle]
             for handle in item.get("source_handles") or []
@@ -1684,7 +1790,7 @@ def complete_transformer_components(
             center_x - diameter * 1.05,
             main_box[1] - diameter * 2.30,
             center_x + diameter * 1.05,
-            main_box[3] + diameter * 0.15,
+            main_box[3] + diameter * 1.20,
         )
         claimed = list(main_circles)
         for shape in shapes:
@@ -1723,6 +1829,7 @@ def complete_transformer_components(
         newly_consumed.update(additions)
         item["source_handles"] = handles
         item["component_owned_handles"] = handles
+        item["physical_boundary_handles"] = handles
         item["absorbed_component_handles"] = sorted(additions)
         item["bbox"] = [
             round(value, 6) for value in completed_box
@@ -1739,6 +1846,396 @@ def complete_transformer_components(
             "local_diameter": round(diameter, 6),
         }
     return newly_consumed
+
+
+def point_inside_expanded_box(
+    point: tuple[float, float],
+    box: tuple[float, float, float, float],
+    padding: float,
+) -> bool:
+    return (
+        box[0] - padding <= point[0] <= box[2] + padding
+        and box[1] - padding <= point[1] <= box[3] + padding
+    )
+
+
+def complete_switch_terminal_stems(
+    equipment: list[dict[str, Any]],
+    shapes: list[Shape],
+    raw_h: float,
+) -> set[str]:
+    """Add short axis-aligned terminal stems without changing symbol core.
+
+    The standard boundary has two levels: diagonal/closed switch geometry is
+    the symbol core, while a local axis-aligned stroke from that core to the
+    next bus is part of the physical component boundary.  Long network wiring
+    remains outside the component.
+    """
+    newly_consumed: set[str] = set()
+    shape_by_handle = {shape.handle: shape for shape in shapes}
+    globally_owned = {
+        handle
+        for item in equipment
+        for handle in item.get("source_handles") or []
+    }
+    for item in equipment:
+        candidate_family = str(
+            item.get("template_family_candidate")
+            or item.get("template_family")
+            or ""
+        )
+        switch_like = (
+            item.get("physical_type") == "SwitchCombination"
+            or candidate_family in SWITCH_FAMILIES
+        )
+        if not switch_like:
+            continue
+        core_handles = list(
+            item.get("symbol_core_handles")
+            or item.get("source_handles")
+            or []
+        )
+        core_shapes = [
+            shape_by_handle[handle]
+            for handle in core_handles
+            if handle in shape_by_handle
+        ]
+        if not core_shapes:
+            continue
+        core_box = merge_bbox(shape.bbox for shape in core_shapes)
+        core_center = bbox_center(core_box)
+        core_width = max(core_box[2] - core_box[0], raw_h)
+        core_height = max(core_box[3] - core_box[1], raw_h)
+        ranked_by_direction: dict[
+            str,
+            tuple[tuple[float, float, str], Shape],
+        ] = {}
+        for shape in shapes:
+            if (
+                shape.handle in globally_owned
+                or annotation_layer(shape.layer)
+                or shape.kind != "line"
+                or not shape_axis_aligned(shape)
+                or not (raw_h * 0.20 <= shape.length <= raw_h * 8.0)
+            ):
+                continue
+            try:
+                start = (
+                    float(shape.entity.dxf.start.x),
+                    float(shape.entity.dxf.start.y),
+                )
+                end = (
+                    float(shape.entity.dxf.end.x),
+                    float(shape.entity.dxf.end.y),
+                )
+            except Exception:
+                continue
+            start_inside = point_inside_expanded_box(
+                start,
+                core_box,
+                raw_h * 0.18,
+            )
+            end_inside = point_inside_expanded_box(
+                end,
+                core_box,
+                raw_h * 0.18,
+            )
+            if start_inside == end_inside:
+                continue
+            near = start if start_inside else end
+            far = end if start_inside else start
+            width = shape.bbox[2] - shape.bbox[0]
+            height = shape.bbox[3] - shape.bbox[1]
+            if height >= width:
+                if abs(near[0] - core_center[0]) > max(
+                    raw_h * 0.35,
+                    core_width * 0.30,
+                ):
+                    continue
+                direction = "top" if far[1] > core_center[1] else "bottom"
+                alignment_error = abs(near[0] - core_center[0])
+            else:
+                if abs(near[1] - core_center[1]) > max(
+                    raw_h * 0.35,
+                    core_height * 0.30,
+                ):
+                    continue
+                direction = "right" if far[0] > core_center[0] else "left"
+                alignment_error = abs(near[1] - core_center[1])
+            if point_inside_expanded_box(
+                far,
+                core_box,
+                raw_h * 0.25,
+            ):
+                continue
+            rank = (alignment_error, shape.length, shape.handle)
+            previous = ranked_by_direction.get(direction)
+            if previous is None or rank < previous[0]:
+                ranked_by_direction[direction] = (rank, shape)
+
+        limit = max(
+            1,
+            min(int(item.get("terminal_count_from_template") or 2), 2),
+        )
+        additions = [
+            value[1]
+            for _, value in sorted(
+                ranked_by_direction.items(),
+                key=lambda pair: pair[1][0],
+            )[:limit]
+        ]
+        if not additions:
+            item.setdefault(
+                "physical_boundary_handles",
+                sorted(core_handles),
+            )
+            continue
+        physical_handles = sorted(
+            set(item.get("source_handles") or [])
+            | {shape.handle for shape in additions}
+        )
+        physical_shapes = [
+            shape_by_handle[handle]
+            for handle in physical_handles
+            if handle in shape_by_handle
+        ]
+        physical_box = merge_bbox(shape.bbox for shape in physical_shapes)
+        item["source_handles"] = physical_handles
+        item["component_owned_handles"] = physical_handles
+        item["physical_boundary_handles"] = physical_handles
+        item["terminal_stem_handles"] = sorted(
+            shape.handle for shape in additions
+        )
+        item["bbox"] = [round(value, 6) for value in physical_box]
+        item["center"] = [
+            round((physical_box[0] + physical_box[2]) / 2.0, 6),
+            round((physical_box[1] + physical_box[3]) / 2.0, 6),
+        ]
+        item["terminal_stem_completion"] = {
+            "method": "axis_aligned_core_exit_ownership",
+            "maximum_length": "8H",
+            "absorbed_count": len(additions),
+        }
+        addition_handles = {shape.handle for shape in additions}
+        globally_owned.update(addition_handles)
+        newly_consumed.update(addition_handles)
+    return newly_consumed
+
+
+def build_functional_boundary_objects(
+    texts: list[dict[str, Any]],
+    shapes: list[Shape],
+    equipment: list[dict[str, Any]],
+    raw_h: float,
+) -> list[dict[str, Any]]:
+    """Build non-physical functional branches and local assembly boundaries."""
+    output: list[dict[str, Any]] = []
+    physical_handles = {
+        handle
+        for item in equipment
+        for handle in item.get("physical_boundary_handles")
+        or item.get("source_handles")
+        or []
+    }
+
+    for text in texts:
+        compact = "".join(str(text.get("text") or "").upper().split())
+        if compact != "PT" and "鐢靛帇浜掓劅" not in compact:
+            continue
+        point_box = (
+            float(text["x"]),
+            float(text["y"]),
+            float(text["x"]),
+            float(text["y"]),
+        )
+        lines = [
+            shape
+            for shape in shapes
+            if shape.kind == "line"
+            and shape_axis_aligned(shape)
+            and shape.length >= raw_h * 8.0
+            and bbox_distance(shape.bbox, point_box) <= raw_h * 8.0
+        ]
+        if not lines:
+            continue
+        line = min(
+            lines,
+            key=lambda shape: (
+                bbox_distance(shape.bbox, point_box),
+                shape.handle,
+            ),
+        )
+        output.append(
+            {
+                "functional_object_id": "",
+                "functional_type": "VoltageTransformerFunctionalBranch",
+                "boundary_level": "functional_assembly",
+                "label": str(text.get("text") or ""),
+                "geometry_handles": [line.handle],
+                "annotation_handles": [str(text["handle"])],
+                "source_handles": [line.handle, str(text["handle"])],
+                "bbox": [round(value, 6) for value in line.bbox],
+                "confidence": 0.90,
+                "basis": "PT label associated with nearest long axis-aligned branch",
+            }
+        )
+
+    for frame in shapes:
+        if (
+            frame.handle in physical_handles
+            or annotation_layer(frame.layer)
+            or not (frame.closed or frame.kind == "polygon")
+        ):
+            continue
+        span = max(
+            frame.bbox[2] - frame.bbox[0],
+            frame.bbox[3] - frame.bbox[1],
+        )
+        if not (raw_h * 8.0 < span <= raw_h * 12.0):
+            continue
+        region = (
+            frame.bbox[0] - raw_h * 3.0,
+            frame.bbox[1],
+            frame.bbox[2] + raw_h * 3.0,
+            frame.bbox[3] + raw_h * 16.0,
+        )
+        members = []
+        for shape in shapes:
+            if shape.handle == frame.handle or annotation_layer(shape.layer):
+                continue
+            center = bbox_center(shape.bbox)
+            member_span = max(
+                shape.bbox[2] - shape.bbox[0],
+                shape.bbox[3] - shape.bbox[1],
+            )
+            if (
+                region[0] <= center[0] <= region[2]
+                and region[1] <= center[1] <= region[3]
+                and member_span <= raw_h * 8.0
+                and shape.kind in {"line", "polyline", "circle", "arc"}
+            ):
+                members.append(shape)
+        if len(members) < 2:
+            continue
+        handles = sorted(
+            {frame.handle} | {shape.handle for shape in members}
+        )
+        assembly_box = merge_bbox(
+            [frame.bbox] + [shape.bbox for shape in members]
+        )
+        output.append(
+            {
+                "functional_object_id": "",
+                "functional_type": "ProtectionBranchAssembly",
+                "boundary_level": "functional_assembly",
+                "label": "",
+                "geometry_handles": handles,
+                "annotation_handles": [],
+                "source_handles": handles,
+                "bbox": [round(value, 6) for value in assembly_box],
+                "confidence": 0.70,
+                "basis": (
+                    "medium closed frame grouped with vertically aligned "
+                    "local switch/protection geometry"
+                ),
+            }
+        )
+
+    output.sort(
+        key=lambda item: (
+            item["bbox"][0],
+            item["bbox"][1],
+            item["functional_type"],
+        )
+    )
+    for index, item in enumerate(output, 1):
+        item["functional_object_id"] = f"FO{index:05d}"
+    return output
+
+
+def finalize_equipment_boundary_levels(
+    equipment: list[dict[str, Any]],
+) -> None:
+    for item in equipment:
+        core = sorted(
+            set(
+                item.get("symbol_core_handles")
+                or item.get("source_handles")
+                or []
+            )
+        )
+        physical = sorted(
+            set(
+                item.get("physical_boundary_handles")
+                or item.get("source_handles")
+                or []
+            )
+        )
+        item["symbol_core_handles"] = core
+        item["physical_boundary_handles"] = physical
+        item["source_handles"] = physical
+        item["boundary_levels"] = {
+            "symbol_core": {
+                "handles": core,
+                "meaning": "distinctive symbol geometry only",
+            },
+            "physical_component": {
+                "handles": physical,
+                "meaning": "symbol core plus owned terminal stems/details",
+            },
+        }
+
+
+def suppress_functional_fragment_equipment(
+    equipment: list[dict[str, Any]],
+    functional_objects: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Avoid duplicating assembly-only fragments as physical equipment."""
+    assembly_handle_sets = [
+        set(map(str, item.get("source_handles") or []))
+        for item in functional_objects
+        if item.get("boundary_level") == "functional_assembly"
+        and item.get("functional_type") != (
+            "VoltageTransformerFunctionalBranch"
+        )
+    ]
+    retained = []
+    suppressed = []
+    for item in equipment:
+        handles = set(
+            map(
+                str,
+                item.get("physical_boundary_handles")
+                or item.get("source_handles")
+                or [],
+            )
+        )
+        is_unknown_fragment = (
+            item.get("physical_type") == "UnknownComponent"
+            and item.get("boundary_recognition_status")
+            == "recognized_unknown_type"
+            and handles
+            and any(
+                handles <= assembly_handles
+                for assembly_handles in assembly_handle_sets
+            )
+        )
+        if not is_unknown_fragment:
+            retained.append(item)
+            continue
+        suppressed.append(
+            {
+                "equipment_id_before_renumbering": item.get(
+                    "equipment_id"
+                ),
+                "source_handles": sorted(handles),
+                "reason": (
+                    "unknown fragment wholly contained in a separately "
+                    "recognized functional assembly"
+                ),
+            }
+        )
+    return retained, suppressed
 
 
 def attach_visible_equipment_names(
@@ -2065,6 +2562,169 @@ def build_conductor_graph(
         else:
             add_event("x_not_connected", point, left, right, "not_connected")
     return union, list(events.values())
+
+
+def preclassify_conductor_skeleton(
+    shapes: list[Shape],
+    raw_h: float,
+) -> tuple[set[str], dict[str, Any]]:
+    """Find only high-confidence conductor handles before component grouping.
+
+    This pass is deliberately conservative.  It considers open axis-aligned
+    geometry only, and removes a handle from component candidate generation
+    only when the stroke itself is long or belongs to a sufficiently extended
+    connected axis network.  The original shapes are retained for final
+    conductor topology and for post-recognition terminal-stem completion.
+    """
+    segments: list[Segment] = []
+    handle_lengths: Counter[str] = Counter()
+    handle_segment_indices: dict[str, list[int]] = defaultdict(list)
+    for shape in shapes:
+        if (
+            annotation_layer(shape.layer)
+            or shape.closed
+            or shape.kind not in {"line", "polyline"}
+            or not shape_axis_aligned(shape)
+        ):
+            continue
+        vertices = shape_raw_vertices(shape)
+        for segment_index, (start, end) in enumerate(
+            zip(vertices, vertices[1:])
+        ):
+            segment = Segment(
+                segment_id=f"{shape.handle}:pre:{segment_index}",
+                evidence_id=shape.handle,
+                layer=shape.layer,
+                start=start,
+                end=end,
+            )
+            if (
+                segment.length < raw_h * MINIMUM_WIRE_H
+                or not (segment.horizontal or segment.vertical)
+            ):
+                continue
+            index = len(segments)
+            segments.append(segment)
+            handle_segment_indices[shape.handle].append(index)
+            handle_lengths[shape.handle] += segment.length
+
+    if not segments:
+        return set(), {
+            "policy": "high_precision_axis_conductor_skeleton",
+            "candidate_handle_count": 0,
+            "high_confidence_handle_count": 0,
+            "rows": [],
+        }
+
+    union, events = build_conductor_graph(segments, shapes, raw_h)
+    root_indices: dict[int, list[int]] = defaultdict(list)
+    for index in range(len(segments)):
+        root_indices[union.find(index)].append(index)
+
+    root_statistics: dict[int, dict[str, Any]] = {}
+    for root, indices in root_indices.items():
+        root_segments = [segments[index] for index in indices]
+        boxes = [segment.bbox for segment in root_segments]
+        box = (
+            min(item[0] for item in boxes),
+            min(item[1] for item in boxes),
+            max(item[2] for item in boxes),
+            max(item[3] for item in boxes),
+        )
+        root_statistics[root] = {
+            "total_length": sum(segment.length for segment in root_segments),
+            "span": max(box[2] - box[0], box[3] - box[1]),
+            "handles": {
+                segment.evidence_id for segment in root_segments
+            },
+        }
+
+    event_counts: Counter[int] = Counter()
+    first_index_by_handle = {
+        handle: indices[0]
+        for handle, indices in handle_segment_indices.items()
+        if indices
+    }
+    for event in events:
+        if event.get("state") != "connected":
+            continue
+        roots = {
+            union.find(first_index_by_handle[handle])
+            for handle in event.get("source_handles") or []
+            if handle in first_index_by_handle
+        }
+        for root in roots:
+            event_counts[root] += 1
+
+    high_confidence: set[str] = set()
+    rows = []
+    for handle, indices in sorted(handle_segment_indices.items()):
+        roots = {union.find(index) for index in indices}
+        root_total = max(
+            root_statistics[root]["total_length"] for root in roots
+        )
+        root_span = max(root_statistics[root]["span"] for root in roots)
+        root_handle_count = max(
+            len(root_statistics[root]["handles"]) for root in roots
+        )
+        connected_event_count = max(
+            event_counts.get(root, 0) for root in roots
+        )
+        reasons = []
+        if handle_lengths[handle] >= raw_h * 4.0:
+            reasons.append("individual_axis_length_at_least_4H")
+        if (
+            root_handle_count >= 2
+            and root_total >= raw_h * 6.0
+            and root_span >= raw_h * 4.0
+        ):
+            reasons.append("extended_multi_handle_axis_network")
+        if (
+            connected_event_count >= 2
+            and root_total >= raw_h * 5.0
+        ):
+            reasons.append("multiple_connections_in_axis_network")
+        is_high_confidence = bool(reasons)
+        if is_high_confidence:
+            high_confidence.add(handle)
+        rows.append(
+            {
+                "handle": handle,
+                "axis_length_h": round(
+                    handle_lengths[handle] / raw_h,
+                    6,
+                ),
+                "network_total_length_h": round(
+                    root_total / raw_h,
+                    6,
+                ),
+                "network_span_h": round(root_span / raw_h, 6),
+                "network_handle_count": root_handle_count,
+                "connected_event_count": connected_event_count,
+                "classification": (
+                    "high_confidence_conductor"
+                    if is_high_confidence
+                    else "ambiguous_axis_geometry"
+                ),
+                "reasons": reasons,
+            }
+        )
+    return high_confidence, {
+        "policy": "high_precision_axis_conductor_skeleton",
+        "thresholds": {
+            "minimum_axis_segment": "1.50H",
+            "individual_long_stroke": "4.00H",
+            "extended_network_total_length": "6.00H",
+            "extended_network_span": "4.00H",
+            "connected_network_total_length": "5.00H",
+        },
+        "candidate_handle_count": len(handle_segment_indices),
+        "high_confidence_handle_count": len(high_confidence),
+        "ambiguous_handle_count": (
+            len(handle_segment_indices) - len(high_confidence)
+        ),
+        "rows": rows,
+    }
 
 
 def boundary_port_candidates(
@@ -3023,12 +3683,98 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def learned_boundary_shape_groups(
+    dxf_path: Path,
+    shapes: list[Shape],
+    reserved_handles: set[str],
+    runtime: dict[str, Any],
+) -> tuple[list[list[Shape]], list[dict[str, Any]], dict[str, Any]]:
+    """Map primitive-level learned boundaries back to production DXF shapes.
+
+    One polyline HANDLE may produce several model primitives.  If those
+    primitives receive conflicting cluster IDs, the complete DXF entity is
+    assigned to the cluster receiving the most primitive votes.  This keeps
+    the downstream topology representation HANDLE-addressable and prevents a
+    single DXF entity from being consumed by two equipment objects.
+    """
+
+    result, _, _, _ = runtime["infer"](
+        dxf_path, runtime, CANONICAL_H
+    )
+    by_handle = {str(shape.handle).upper(): shape for shape in shapes}
+    reserved = {str(handle).upper() for handle in reserved_handles}
+    votes: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    confidence: dict[int, float] = {}
+    component_record: dict[int, dict[str, Any]] = {}
+    for number, component in enumerate(result.get("components") or []):
+        cluster = number
+        raw_id = str(component.get("component_id") or "")
+        if raw_id[1:].isdigit():
+            cluster = int(raw_id[1:])
+        confidence[cluster] = float(component.get("boundary_confidence") or 0.0)
+        component_record[cluster] = component
+        for primitive_id in component.get("primitive_ids") or []:
+            handle = str(primitive_id).rsplit(":", 1)[0].upper()
+            if handle in by_handle and handle not in reserved:
+                votes[handle][cluster] += 1
+
+    owner: dict[str, int] = {}
+    conflicting = 0
+    for handle, counts in votes.items():
+        if len(counts) > 1:
+            conflicting += 1
+        owner[handle] = max(
+            counts,
+            key=lambda cluster: (
+                counts[cluster], confidence.get(cluster, 0.0), -cluster
+            ),
+        )
+    grouped: dict[int, list[Shape]] = defaultdict(list)
+    for handle, cluster in owner.items():
+        grouped[cluster].append(by_handle[handle])
+    rows = []
+    metadata = []
+    for cluster, group in sorted(
+        grouped.items(),
+        key=lambda item: (
+            min(shape.bbox[0] for shape in item[1]),
+            min(shape.bbox[1] for shape in item[1]),
+        ),
+    ):
+        if not group:
+            continue
+        rows.append(sorted(group, key=lambda shape: shape.handle))
+        metadata.append(component_record.get(cluster, {}))
+    audit = {
+        "policy": "learned_dxf_stage2_plus_iterative_stage3",
+        "model_scale_h": CANONICAL_H,
+        "model_component_count": int(result.get("component_count") or 0),
+        "mapped_component_count": len(rows),
+        "mapped_handle_count": len(owner),
+        "conflicting_handle_count": conflicting,
+        "unmapped_model_component_count": max(
+            int(result.get("component_count") or 0) - len(rows), 0
+        ),
+        "stage2": result.get("stage2"),
+        "stage3": {
+            key: value
+            for key, value in (result.get("stage3") or {}).items()
+            if key != "membership_source"
+        },
+        "parser_audit": result.get("parser_audit"),
+    }
+    return rows, metadata, audit
+
+
 def recognize_one(
     dxf_path: Path,
     component_library_path: Path,
     component_library: dict[str, Any],
     logic_library_path: Path,
     logic_library: dict[str, Any],
+    boundary_model: dict[str, Any] | None = None,
+    candidate_strategy: str = "learned_iterative",
+    learned_boundary_runtime: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     doc = ezdxf.readfile(dxf_path)
     flat_records, insert_audit, visibility_audit = flatten_modelspace(doc)
@@ -3055,13 +3801,68 @@ def recognize_one(
         for shape in shapes
         if shape.handle not in block_reserved_handles
     ]
-
-    seeds = [
-        shape for shape in free_shapes if device_seed(shape, raw_h)
-    ]
-    groups = cluster_shapes(seeds, raw_h * INITIAL_GROUP_GAP_H)
-    groups = localize_oversized_groups(groups, raw_h)
-    groups = expand_seed_groups(groups, free_shapes, raw_h)
+    learned_group_metadata: list[dict[str, Any]] = []
+    learned_frontend_audit: dict[str, Any] = {"enabled": False}
+    if candidate_strategy == "learned_iterative":
+        if learned_boundary_runtime is None:
+            raise ValueError(
+                "learned_iterative strategy requires learned boundary runtime"
+            )
+        groups, learned_group_metadata, learned_frontend_audit = (
+            learned_boundary_shape_groups(
+                dxf_path,
+                shapes,
+                block_reserved_handles,
+                learned_boundary_runtime,
+            )
+        )
+        learned_handles = {
+            shape.handle for group in groups for shape in group
+        }
+        preliminary_conductor_handles = {
+            shape.handle for shape in free_shapes
+            if shape.handle not in learned_handles
+        }
+        conductor_prefilter_audit = {
+            "policy": "learned_frontend_non_component_shapes",
+            "candidate_handle_count": len(free_shapes),
+            "high_confidence_handle_count": len(
+                preliminary_conductor_handles
+            ),
+            "ambiguous_handle_count": 0,
+            "rows": [],
+        }
+        component_search_shapes = [
+            shape for group in groups for shape in group
+        ]
+        seeds = []
+    elif candidate_strategy == "conductor_prefilter":
+        preliminary_conductor_handles, conductor_prefilter_audit = (
+            preclassify_conductor_skeleton(free_shapes, raw_h)
+        )
+    else:
+        preliminary_conductor_handles = set()
+        conductor_prefilter_audit = {
+            "policy": "disabled_mixed_geometry_baseline",
+            "candidate_handle_count": 0,
+            "high_confidence_handle_count": 0,
+            "ambiguous_handle_count": 0,
+            "rows": [],
+        }
+    if candidate_strategy != "learned_iterative":
+        component_search_shapes = [
+            shape
+            for shape in free_shapes
+            if shape.handle not in preliminary_conductor_handles
+        ]
+        seeds = [
+            shape
+            for shape in component_search_shapes
+            if device_seed(shape, raw_h)
+        ]
+        groups = cluster_shapes(seeds, raw_h * INITIAL_GROUP_GAP_H)
+        groups = localize_oversized_groups(groups, raw_h)
+        groups = expand_seed_groups(groups, component_search_shapes, raw_h)
     maximum_template_primitives = max(
         (
             sum(
@@ -3095,45 +3896,50 @@ def recognize_one(
             if bbox_distance(shape.bbox, box) <= raw_h * NEARBY_LINE_H
         ]
         candidates = generate_group_candidates(
-            group_id,
-            group,
-            nearby_lines,
-            raw_h,
+            group_id, group, nearby_lines, raw_h
         )
+        if candidate_strategy == "learned_iterative":
+            # Stage 3 has already selected the boundary.  Stage 4 must classify
+            # that boundary, not silently enumerate a different subset.
+            candidates = [
+                candidate for candidate in candidates
+                if candidate.get("mode") == "complete_group"
+            ][:1]
         generated_candidate_count = len(candidates)
         group_shape_by_handle = {
             shape.handle: shape for shape in group
         }
-        candidates = [
-            candidate
-            for candidate in candidates
-            if sum(candidate["primitive_counts"].values())
-            <= maximum_template_primitives * 2
-            and (
-                not candidate["bbox"]
-                or max(
-                    candidate["bbox"][2] - candidate["bbox"][0],
-                    candidate["bbox"][3] - candidate["bbox"][1],
+        if candidate_strategy != "learned_iterative":
+            candidates = [
+                candidate
+                for candidate in candidates
+                if sum(candidate["primitive_counts"].values())
+                <= maximum_template_primitives * 2
+                and (
+                    not candidate["bbox"]
+                    or max(
+                        candidate["bbox"][2] - candidate["bbox"][0],
+                        candidate["bbox"][3] - candidate["bbox"][1],
+                    )
+                    <= raw_h * 12.0
+                    and max(
+                        candidate["bbox"][2] - candidate["bbox"][0],
+                        candidate["bbox"][3] - candidate["bbox"][1],
+                    )
+                    >= raw_h * 0.20
                 )
-                <= raw_h * 12.0
-                and max(
-                    candidate["bbox"][2] - candidate["bbox"][0],
-                    candidate["bbox"][3] - candidate["bbox"][1],
+                and not (
+                    len(candidate["owned_handles"]) == 1
+                    and candidate["owned_handles"][0] in group_shape_by_handle
+                    and group_shape_by_handle[
+                        candidate["owned_handles"][0]
+                    ].kind
+                    in {"line", "polyline"}
+                    and not group_shape_by_handle[
+                        candidate["owned_handles"][0]
+                    ].closed
                 )
-                >= raw_h * 0.20
-            )
-            and not (
-                len(candidate["owned_handles"]) == 1
-                and candidate["owned_handles"][0] in group_shape_by_handle
-                and group_shape_by_handle[
-                    candidate["owned_handles"][0]
-                ].kind
-                in {"line", "polyline"}
-                and not group_shape_by_handle[
-                    candidate["owned_handles"][0]
-                ].closed
-            )
-        ]
+            ]
         if not candidates:
             # Single seeds remain auditable even when the enclosing seed group
             # is an oversized background structure.
@@ -3154,7 +3960,20 @@ def recognize_one(
             candidates,
             evaluations,
             raw_h,
+            boundary_model,
         )
+        if candidate_strategy == "learned_iterative":
+            learned = learned_group_metadata[group_index - 1]
+            result["learned_frontend_boundary"] = {
+                "accepted": True,
+                "component_id": learned.get("component_id"),
+                "boundary_confidence": learned.get("boundary_confidence"),
+                "primitive_count": learned.get("primitive_count"),
+                "seed_primitive_count": learned.get("seed_primitive_count"),
+                "reabsorbed_primitive_count": learned.get(
+                    "reabsorbed_primitive_count"
+                ),
+            }
         group_results.append(result)
         priors.append(prior)
         candidate_audit.append(
@@ -3170,6 +3989,34 @@ def recognize_one(
                 "top5_families": result["family_alternatives"],
                 "family_margin": result["family_margin"],
                 "text_prior": prior,
+                "boundary_learning": result.get("boundary_learning"),
+                "learned_frontend_boundary": result.get(
+                    "learned_frontend_boundary"
+                ),
+                "boundary_candidate_predictions": (
+                    [
+                        {
+                            "candidate_id": evaluation["candidate"][
+                                "candidate_id"
+                            ],
+                            "owned_handles": evaluation["candidate"][
+                                "owned_handles"
+                            ],
+                            "predicted_boundary_f1": (
+                                evaluation.get("boundary_learning") or {}
+                            ).get("score"),
+                            "top_template_family": evaluation["ranked"][0][
+                                "family"
+                            ],
+                            "top_template_score": evaluation["ranked"][0][
+                                "combined_score"
+                            ],
+                        }
+                        for evaluation in evaluations
+                    ]
+                    if boundary_model is not None
+                    else []
+                ),
             }
         )
 
@@ -3182,13 +4029,46 @@ def recognize_one(
         block_reserved_handles,
     )
     equipment = block_equipment + geometry_equipment
-    consumed.update(
-        complete_transformer_components(
-            equipment,
-            shapes,
-            raw_h,
+    if candidate_strategy != "learned_iterative":
+        consumed.update(
+            complete_transformer_components(
+                equipment,
+                shapes,
+                raw_h,
+            )
         )
+        consumed.update(
+            complete_switch_terminal_stems(
+                equipment,
+                shapes,
+                raw_h,
+            )
+        )
+    finalize_equipment_boundary_levels(equipment)
+    functional_objects = build_functional_boundary_objects(
+        texts,
+        shapes,
+        equipment,
+        raw_h,
     )
+    if candidate_strategy == "learned_iterative":
+        suppressed_functional_fragments = []
+    else:
+        equipment, suppressed_functional_fragments = (
+            suppress_functional_fragment_equipment(
+                equipment,
+                functional_objects,
+            )
+        )
+    suppressed_object_ids = {
+        item["equipment_id_before_renumbering"]
+        for item in suppressed_functional_fragments
+    }
+    geometry_equipment = [
+        item
+        for item in geometry_equipment
+        if item.get("equipment_id") not in suppressed_object_ids
+    ]
     consumed.update(
         handle
         for item in equipment
@@ -3200,6 +4080,11 @@ def recognize_one(
     attach_visible_equipment_names(equipment, texts, raw_h)
     for index, item in enumerate(equipment, 1):
         item["equipment_id"] = f"EQ{index:05d}"
+        item["source_evidence"] = provenance_for_handles(
+            item["source_handles"],
+            record_by_id,
+        )
+    for item in functional_objects:
         item["source_evidence"] = provenance_for_handles(
             item["source_handles"],
             record_by_id,
@@ -3250,8 +4135,13 @@ def recognize_one(
         union,
         raw_h,
     )
+    learned_frontend_enabled = candidate_strategy == "learned_iterative"
     base = {
-        "schema_version": "independent-block-template-topology-v4",
+        "schema_version": (
+            "learned-boundary-topology-v5"
+            if learned_frontend_enabled
+            else "independent-block-template-topology-v4"
+        ),
         "generated_at": datetime.now().astimezone().isoformat(),
         "drawing": {
             "file": dxf_path.name,
@@ -3260,7 +4150,11 @@ def recognize_one(
             "modelspace_entity_count": len(doc.modelspace()),
         },
         "recognition_strategy": {
-            "name": "block_first_recursive_geometry_fallback",
+            "name": (
+                "learned_iterative_boundary_then_template_topology"
+                if learned_frontend_enabled
+                else "block_first_recursive_geometry_fallback"
+            ),
             "truth_used_during_recognition": False,
             "pseudo_truth_module_imported": False,
             "block_policy": {
@@ -3279,28 +4173,76 @@ def recognize_one(
                 ],
                 "free_geometry_fallback": True,
             },
-            "steps": [
-                "排除关闭、冻结和不打印图层，再递归展开可见INSERT并应用块变换。",
-                "从闭合、圆形、斜线和短图元生成几何候选。",
-                "每个候选与全部设备模板逐一比较。",
-                "先确认元件并占用图元，再从剩余图元生成导线。",
-                "仅保留连接到元件接口的活动导线网络及交叉事件。",
-                "最后使用电气逻辑知识库增加连接上下文语义。",
-                "将柜体作为容器建立柜内详细拓扑和柜体工程拓扑两级结果。",
-            ],
+            "steps": (
+                [
+                    "递归展开可见DXF实体并转换为匿名矢量图元。",
+                    "使用DXF迁移后的图网络计算元件主体、接口和主导线概率。",
+                    "使用同元件边模型和迭代算法形成不可由模板阶段删除的元件边界。",
+                    "对完整边界进行标准模板匹配，不能可靠分类时保留为未知元件。",
+                    "从未被元件占用的图元建立导线网络、接口和连接节点。",
+                    "使用电气逻辑知识库补充上下文语义并生成两级拓扑。",
+                ]
+                if learned_frontend_enabled
+                else [
+                    "排除关闭、冻结和不打印图层，再递归展开可见INSERT并应用块变换。",
+                    "从闭合、圆形、斜线和短图元生成几何候选。",
+                    "每个候选与全部设备模板逐一比较。",
+                    "先确认元件并占用图元，再从剩余图元生成导线。",
+                    "仅保留连接到元件接口的活动导线网络及交叉事件。",
+                    "最后使用电气逻辑知识库增加连接上下文语义。",
+                    "将柜体作为容器建立柜内详细拓扑和柜体工程拓扑两级结果。",
+                ]
+            ),
+            "boundary_learning": (
+                {
+                    "enabled": True,
+                    "model_schema": boundary_model["schema_version"],
+                    "model_path": boundary_model.get("path"),
+                    "acceptance_threshold": boundary_acceptance_threshold(
+                        boundary_model
+                    ),
+                    "category_or_symbol_fields_used_as_features": False,
+                    "unknown_type_output": "UnknownComponent",
+                }
+                if boundary_model is not None
+                else {"enabled": False}
+            ),
+            "component_candidate_strategy": {
+                "name": candidate_strategy,
+                "high_confidence_conductors_removed_before_grouping": (
+                    candidate_strategy == "conductor_prefilter"
+                ),
+                "ambiguous_axis_geometry_retained": True,
+                "original_geometry_retained_for_final_topology": True,
+                "learned_frontend_is_authoritative_boundary": (
+                    candidate_strategy == "learned_iterative"
+                ),
+            },
         },
         "interface_definition": {
             "standard": "component_side",
             "canonical_coordinate_field": "port_position",
             "conductor_coordinate_field": "wire_attach_position",
             "connectivity_field": "connectivity_node",
+            "boundary_levels": {
+                "symbol_core_handles": (
+                    "distinctive geometry used to recognize the symbol"
+                ),
+                "physical_boundary_handles": (
+                    "symbol core plus owned terminal stems and details"
+                ),
+                "functional_objects": (
+                    "non-physical branches, labels and local assemblies"
+                ),
+            },
         },
         "truth_used_during_recognition": False,
         "equipment": equipment,
         "terminals": terminals,
         "connectivity_nodes": nodes,
         "crossings": crossings,
-        "functional_annotations": [],
+        "functional_annotations": functional_objects,
+        "functional_objects": functional_objects,
         "derived_device_edges": edges,
         "engineering_topology": engineering_topology,
         "issues": [
@@ -3336,6 +4278,13 @@ def recognize_one(
             ),
             "shape_count_after_dedup": len(shapes),
             "device_seed_count": len(seeds),
+            "component_candidate_strategy": candidate_strategy,
+            "preliminary_conductor_handle_count": len(
+                preliminary_conductor_handles
+            ),
+            "component_search_shape_count": len(
+                component_search_shapes
+            ),
             "block_insert_candidate_count": len(insert_audit),
             "accepted_block_equipment_count": len(block_equipment),
             "accepted_free_geometry_equipment_count": len(
@@ -3351,6 +4300,15 @@ def recognize_one(
                 item["candidate_count"] for item in candidate_audit
             ),
             "accepted_equipment_count": len(equipment),
+            "functional_object_count": len(functional_objects),
+            "symbol_core_primitive_count": sum(
+                len(item.get("symbol_core_handles") or [])
+                for item in equipment
+            ),
+            "physical_boundary_primitive_count": sum(
+                len(item.get("physical_boundary_handles") or [])
+                for item in equipment
+            ),
             "rejected_candidate_count": len(rejected),
             "conductor_candidate_count": len(segments),
             "active_conductor_component_count": len(active_roots),
@@ -3398,10 +4356,17 @@ def recognize_one(
         item["functional_role"] = (
             (item.get("logic_inference") or {}).get("functional_role")
         )
-        item["physical_recognition_status"] = "recognized"
+        item["physical_recognition_status"] = (
+            "unknown_type_boundary_retained"
+            if item.get("physical_type") == "UnknownComponent"
+            else "recognized"
+        )
     enhanced["detailed_topology"] = {
         "schema_version": "detailed-component-topology-v1",
         "equipment": copy.deepcopy(enhanced["equipment"]),
+        "functional_objects": copy.deepcopy(
+            enhanced.get("functional_objects") or []
+        ),
         "terminals": copy.deepcopy(enhanced["terminals"]),
         "connectivity_nodes": copy.deepcopy(
             enhanced["connectivity_nodes"]
@@ -3413,11 +4378,20 @@ def recognize_one(
     }
 
     audit = {
-        "schema_version": "independent-block-template-audit-v4",
+        "schema_version": (
+            "learned-boundary-topology-audit-v5"
+            if learned_frontend_enabled
+            else "independent-block-template-audit-v4"
+        ),
         "drawing": enhanced["drawing"],
         "visibility_filter": visibility_audit,
         "insert_expansion": insert_audit,
         "block_candidates": block_candidate_audit,
+        "conductor_prefilter": conductor_prefilter_audit,
+        "learned_frontend": learned_frontend_audit,
+        "functional_fragment_suppression": (
+            suppressed_functional_fragments
+        ),
         "candidate_groups": candidate_audit,
         "rejected_candidates": rejected,
         "statistics": enhanced["automatic_statistics"],
@@ -3427,6 +4401,10 @@ def recognize_one(
 
 def save_report(path: Path, result: dict[str, Any]) -> None:
     stats = result["automatic_statistics"]
+    learned = (
+        result.get("recognition_strategy", {}).get("component_candidate_strategy", {})
+        .get("name") == "learned_iterative"
+    )
     type_counts = Counter(
         item["physical_type"] for item in result["equipment"]
     )
@@ -3437,6 +4415,10 @@ def save_report(path: Path, result: dict[str, Any]) -> None:
         "- 标注生成模块导入：否",
         "- 图层范围：仅识别可见且可打印的图层",
         "- 块引用：递归展开并保留来源路径",
+        (
+            "- 元件边界：DXF迁移图网络与迭代边界算法"
+            if learned else "- 元件边界：规则式几何候选"
+        ),
         "- 元件匹配：每个候选与全部标准模板逐一比较",
         "- 导线范围：确认元件后，仅从剩余非标注图层的长轴向图元生成",
         "- 交叉范围：仅保存与元件接口相连的活动导线网络事件",
@@ -3479,8 +4461,12 @@ def save_report(path: Path, result: dict[str, Any]) -> None:
         lines.append(f"- {name}: {count}")
     lines += [
         "",
-        "低于模板阈值、类型间差距过小、只含单条普通直线/圆或与高分元件重叠的"
-        "候选均不进入正式拓扑，而保留在审计JSON中。",
+        (
+            "学习式边界不会因模板分数不足而删除；无法可靠分类的边界保存为UnknownComponent。"
+            if learned else
+            "低于模板阈值、类型间差距过小、只含单条普通直线/圆或与高分元件重叠的"
+            "候选均不进入正式拓扑，而保留在审计JSON中。"
+        ),
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -3492,10 +4478,71 @@ def main() -> None:
     parser.add_argument("--logic-library", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--drawings", nargs="+", required=True)
+    parser.add_argument(
+        "--boundary-model",
+        type=Path,
+        help=(
+            "optional category-agnostic learned boundary model; when enabled, "
+            "high-confidence boundaries may be retained as UnknownComponent"
+        ),
+    )
+    parser.add_argument(
+        "--candidate-strategy",
+        choices=(
+            "learned_iterative",
+            "conductor_prefilter",
+            "mixed_geometry",
+        ),
+        default="learned_iterative",
+        help=(
+            "use the learned DXF stage-2/stage-3 frontend (default), or run "
+            "one of the retained legacy candidate baselines"
+        ),
+    )
+    parser.add_argument(
+        "--learned-boundary-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1]
+        / "component_boundary_segmentation",
+        help="directory containing the learned DXF boundary package",
+    )
+    parser.add_argument(
+        "--learned-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+    )
     args = parser.parse_args()
 
     component_library = read_json(args.component_library)
     logic_library = read_json(args.logic_library)
+    boundary_model = (
+        load_boundary_model(args.boundary_model)
+        if args.boundary_model is not None
+        else None
+    )
+    learned_boundary_runtime = None
+    if args.candidate_strategy == "learned_iterative":
+        learned_src = args.learned_boundary_root / "src"
+        if str(learned_src) not in sys.path:
+            sys.path.insert(0, str(learned_src))
+        from segment_real_dxf_iterative import (
+            infer_dxf_boundaries,
+            load_iterative_runtime,
+        )
+
+        learned_boundary_runtime = load_iterative_runtime(
+            args.learned_boundary_root
+            / "models"
+            / "base_conductor_deployment.joblib",
+            args.learned_boundary_root
+            / "models"
+            / "component_side_dxf_deployment.pt",
+            args.learned_boundary_root
+            / "models"
+            / "same_component_edge_dxf_deployment.joblib",
+            args.learned_device,
+        )
+        learned_boundary_runtime["infer"] = infer_dxf_boundaries
     summaries = []
     for drawing in args.drawings:
         dxf_path = args.dxf_dir / f"{drawing}.dxf"
@@ -3505,6 +4552,9 @@ def main() -> None:
             component_library,
             args.logic_library,
             logic_library,
+            boundary_model,
+            args.candidate_strategy,
+            learned_boundary_runtime,
         )
         drawing_dir = args.output_dir / drawing
         automatic_dir = drawing_dir / "automatic"

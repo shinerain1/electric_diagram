@@ -16,6 +16,17 @@ SVG/XML 数据集或拟人工答案。识别程序运行时只读取 DXF、标�
 - 输出柜体、母线分段、变压器和供电关系组成的工程拓扑。
 - 保存原始 HANDLE、坐标、模板、置信度和审计证据。
 
+## 当前流程
+
+默认入口已经使用学习式前三步：
+
+1. 递归展开DXF并转换为匿名矢量图元；
+2. 梯度提升树和经过DXF迁移的四层边感知图网络输出元件主体、接口短引线和主导线概率；
+3. 同元件边模型与迭代边界算法形成完整元件候选；
+4. 原有稳定流程继续完成模板识别、接口提取、导线连通、电气逻辑和两级拓扑输出。
+
+`component_boundary_segmentation/`保存新版前三步的运行代码、最终模型、测试和验证报告。旧候选规则仅作为对照保留，可用`--candidate-strategy conductor_prefilter`显式运行，不再是默认入口。
+
 ## 环境
 
 - Python 3.12
@@ -58,6 +69,12 @@ python src/recognize_topology.py \
   --drawings synthetic
 ```
 
+默认会从`component_boundary_segmentation/models/`加载三个DXF部署模型。如只想复现GitHub最初上传的规则式候选流程，可增加：
+
+```text
+--candidate-strategy conductor_prefilter
+```
+
 Windows PowerShell 可将反斜杠续行改为一行，或使用反引号续行。
 
 主结果位于：
@@ -96,6 +113,8 @@ output/synthetic/automatic/synthetic_自动识别.json
 
 现有“系统接线图”曾参与规则改进，因此该图上的高指标属于开发图验证。严谨评估
 应冻结程序和知识库，先封存独立标注，再运行识别并由单独的评价程序比较。
+
+在同一组六张DXF、同一HANDLE边界评价口径下，GitHub最初提交的规则式前三步平均边界F1为9.86%，新版迭代前三步为94.22%，元件侧HANDLE F1为94.84%。这六张图参与过DXF迁移训练，因此该结果用于确认代码替换有效，不作为完全独立的泛化结论。详细对照见[docs/learned-frontend-validation.md](docs/learned-frontend-validation.md)。
 
 ## 数据与隐私
 
